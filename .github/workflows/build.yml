@@ -1,0 +1,72 @@
+# Builds the patch on GitHub's Windows runners and publishes the DLL.
+#
+# Why bother: a binary built by a public runner from public source, with a
+# public log, is far easier for a suspicious player -- or an antivirus vendor
+# handling a false-positive report -- to trust than one uploaded from a personal
+# machine.
+#
+# Runs on every push. Pushing a tag like v0.3.0.1 also attaches d3d9.dll to a
+# GitHub Release.
+
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:      # lets you run it by hand from the Actions tab
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Puts cl.exe / rc.exe / link.exe for the 32-bit target on PATH.
+      # windows-latest already ships MSVC, so nothing is installed.
+      - name: Set up MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+          rc /nologo /fo build\version.res src\version.rc || exit /b 1
+          cl /nologo /O1 /Os /GS- /Gy /W3 /Zl /Fo:build\ /c src\d3d9.c || exit /b 1
+          link /nologo /DLL /ENTRY:DllEntry /DEF:src\d3d9.def ^
+               /OUT:build\d3d9.dll /SUBSYSTEM:WINDOWS ^
+               /NODEFAULTLIB /OPT:REF /OPT:ICF /Brepro ^
+               build\d3d9.obj build\version.res kernel32.lib user32.lib || exit /b 1
+
+      - name: Report hash and metadata
+        shell: pwsh
+        run: |
+          $dll = "build/d3d9.dll"
+          $h   = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          $len = (Get-Item $dll).Length
+          Write-Host "SHA256 : $h"
+          Write-Host "Size   : $len bytes"
+          $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $dll))
+          $vi | Select-Object FileDescription, ProductName, FileVersion, CompanyName, LegalCopyright | Format-List
+          # a blank FileVersion means the version resource failed to embed
+          if ([string]::IsNullOrEmpty($vi.FileVersion)) { throw "version resource missing" }
+          "### Build output`n`nSHA-256: ``$h```n`n$len bytes" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d9-dll
+          path: build/d3d9.dll
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/d3d9.dll
+          generate_release_notes: true

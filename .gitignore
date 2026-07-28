@@ -1,0 +1,8 @@
+# build output - never commit binaries, the workflow produces them
+build/
+*.obj
+*.res
+*.lib
+*.exp
+*.dll
+*.pdb

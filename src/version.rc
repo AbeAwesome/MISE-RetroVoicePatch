@@ -1,0 +1,39 @@
+/* Version resource.  No #includes, so it builds with the minimal toolchain:
+ * "1 VERSIONINFO" is the raw id VS_VERSION_INFO expands to.
+ *
+ * Two fields look droppable but are not, both verified by building it without
+ * them:
+ *   FileVersion  - omit it and .NET's FileVersionInfo returns an empty string
+ *                  for *every* field, not just this one, so most tooling sees
+ *                  no metadata at all.  The shell also falls back to the
+ *                  numeric FILEVERSION, so the row cannot be blanked anyway.
+ *   VarFileInfo  - omit the block and every string field goes blank in Explorer.
+ *
+ * Language 0x0000 (neutral) displays as "Language Neutral" rather than
+ * "English (United States)"; it cannot be blanked entirely.
+ */
+
+1 VERSIONINFO
+FILEVERSION    0,3,0,1
+PRODUCTVERSION 0,3,0,1
+FILEOS         0x40004L      /* VOS_NT_WINDOWS32 */
+FILETYPE       0x2L          /* VFT_DLL -> "Application extension" */
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "000004B0"     /* language neutral, Unicode */
+        BEGIN
+            VALUE "FileDescription", "Monkey Island SE - Retro Voice Patch"
+            VALUE "ProductName",     "MISE Retro Voice Patch"
+            VALUE "FileVersion",     "0.3.0.1"
+            VALUE "ProductVersion",  "0.3.0.1"
+            VALUE "CompanyName",     "Downward Punch"
+            VALUE "LegalCopyright",  "CC0 1.0 | github.com/AbeAwesome/MISE-RetroVoicePatch"
+            VALUE "Comments",        "Source: github.com/AbeAwesome/MISE-RetroVoicePatch"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0000, 1200
+    END
+END
