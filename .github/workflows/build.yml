@@ -4,6 +4,10 @@
 # far easier for a suspicious player -- or an antivirus vendor handling a
 # false-positive report -- to trust than one uploaded from a personal machine.
 #
+# Self-contained: it needs only the src/ folder. The MSVC environment is set up
+# inline via vswhere + vcvarsall rather than a third-party action, because the
+# usual one (ilammy/msvc-dev-cmd) is unmaintained and still targets Node 20.
+#
 # Runs on every push. Pushing a tag like v0.3.0.1 also attaches d3d9.dll to a
 # GitHub Release.
 
@@ -23,12 +27,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # No MSVC setup action needed: build.cmd finds Visual Studio via vswhere
-      # and calls vcvarsall itself, exactly as it does locally. That keeps one
-      # copy of the build commands and one less third-party action in the chain.
       - name: Build
         shell: cmd
-        run: build.cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL echo Visual Studio with the C++ x86 toolset was not found & exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x86 || exit /b 1
+          if not exist build mkdir build
+          rc /nologo /fo build\version.res src\version.rc || exit /b 1
+          cl /nologo /O1 /Os /GS- /Gy /W3 /Zl /Fo:build\ /c src\d3d9.c || exit /b 1
+          link /nologo /DLL /ENTRY:DllEntry /DEF:src\d3d9.def ^
+               /OUT:build\d3d9.dll /SUBSYSTEM:WINDOWS ^
+               /NODEFAULTLIB /OPT:REF /OPT:ICF /Brepro ^
+               build\d3d9.obj build\version.res kernel32.lib user32.lib || exit /b 1
 
       - name: Report hash and metadata
         shell: pwsh
