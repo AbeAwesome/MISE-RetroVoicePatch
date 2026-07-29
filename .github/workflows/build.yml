@@ -24,6 +24,11 @@ jobs:
   build:
     runs-on: windows-latest
 
+    # Needed by the release step: without it, repos whose default token is
+    # read-only fail the upload with a 403.
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v7
 
