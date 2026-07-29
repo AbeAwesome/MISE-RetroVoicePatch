@@ -1,11 +1,13 @@
-/*
+﻿/*
  *  MISE Retro Voice Patch  --  proxy d3d9.dll
  *  The Secret of Monkey Island: Special Edition, MISE.exe 2009-07-08 build.
  *
  *  Keeps the voice acting audible in classic (retro) graphics mode, which the
  *  game normally silences.  Two independent mutes have to be undone: an XACT
  *  RPC preset attached to every speech cue, and a per-frame write to the Speech
- *  category volume.  Both are patched in memory, so no game file changes.
+ *  category volume.  A third patch lets subtitles wait for the voice line, which
+ *  the engine already supports but disables in classic mode.  Everything is
+ *  patched in memory, so no game file changes.
  *
  *  Full write-up, including how the addresses and constants were derived, is in
  *  the project notes.  Comments below cover only what is needed to change this
@@ -122,6 +124,41 @@ static const BYTE SIG_SPEECHVOL[] = {
 };
 #define SPEECHVOL_PATCH_OFS 7
 static const BYTE PATCH_SPEECHVOL[] = { 0x0F, 0x57, 0xC9 };  /* xorps xmm1, xmm1 */
+
+/* ------------------------------------------------------------------ */
+/* patch 1b -- let subtitles wait for the voice line in classic mode   */
+/* ------------------------------------------------------------------ */
+
+/* The engine already knows how to hold a subtitle until its voice line
+ * finishes.  When speech starts it stores the line's duration (milliseconds,
+ * straight out of speech.info) in [audioMgr+2BCh] and the talk id in the global
+ * at 5B996Ch; the audio update counts the duration down and clears the global
+ * when it expires; and the SCUMM message tick at 0x498BE0 refuses to decrement
+ * a message's timer while its talk id matches that global.
+ *
+ * Classic mode never benefits, because storing the talk id is gated on the
+ * classic-mode flag at [audioMgr+300h]:
+ *
+ *   0x442B2F  80 BF 00 03 00 00 00   cmp byte ptr [edi+300h], 0
+ *   0x442B36  75 09                  jne  0x442B41        <-- skips the store
+ *   0x442B38  0F BF 45 18            movsx eax, word ptr [ebp+18h]
+ *   0x442B3C  A3 6C 99 5B 00         mov  [5B996Ch], eax
+ *
+ * NOPping that jne stores the talk id in both modes, so the existing hold logic
+ * engages and a subtitle stays up for as long as its voice line plays.  Lines
+ * with no recorded cue never reach here, so they keep their normal timing and
+ * cannot hang.  In Special Edition mode the flag is already zero, so the branch
+ * was never taken and behaviour is unchanged.
+ */
+#define VA_SPEECHHOLD 0x00442B2Fu
+static const BYTE SIG_SPEECHHOLD[] = {
+    0x80, 0xBF, 0x00, 0x03, 0x00, 0x00, 0x00,   /* cmp byte ptr [edi+300h], 0 */
+    0x75, 0x09,                                 /* jne  +9                    */
+    0x0F, 0xBF, 0x45, 0x18,                     /* movsx eax, [ebp+18h]       */
+    0xA3, 0x6C, 0x99, 0x5B, 0x00                /* mov  [5B996Ch], eax        */
+};
+#define SPEECHHOLD_PATCH_OFS 7
+static const BYTE PATCH_SPEECHHOLD[] = { 0x90, 0x90 };       /* nop; nop */
 
 /* ------------------------------------------------------------------ */
 /* patch 2 -- detach the muting RPC preset from the speech soundbank   */
@@ -424,7 +461,7 @@ static BOOL Readable(DWORD va, SIZE_T len)
 static DWORD WINAPI PatchThread(LPVOID unused)
 {
     int i;
-    BOOL didVol = FALSE, didBank = FALSE;
+    BOOL didVol = FALSE, didBank = FALSE, didHold = FALSE;
 
     (void)unused;
 
@@ -437,6 +474,16 @@ static DWORD WINAPI PatchThread(LPVOID unused)
                 didVol = TRUE;
                 Log("[voice] speech category volume unmuted @0x%08X (t=%d ms)",
                     VA_SPEECHVOL + SPEECHVOL_PATCH_OFS, i);
+            }
+        }
+        if (!didHold && Readable(VA_SPEECHHOLD, sizeof(SIG_SPEECHHOLD)) &&
+            MemCmp((const void *)VA_SPEECHHOLD, SIG_SPEECHHOLD,
+                   sizeof(SIG_SPEECHHOLD)) == 0) {
+            if (WriteCode(VA_SPEECHHOLD + SPEECHHOLD_PATCH_OFS,
+                          PATCH_SPEECHHOLD, sizeof(PATCH_SPEECHHOLD))) {
+                didHold = TRUE;
+                Log("[voice] subtitles now wait for speech @0x%08X (t=%d ms)",
+                    VA_SPEECHHOLD + SPEECHHOLD_PATCH_OFS, i);
             }
         }
         if (!didBank && Readable(VA_CSB_CALL, sizeof(SIG_CSB_CALL)) &&
@@ -452,13 +499,13 @@ static DWORD WINAPI PatchThread(LPVOID unused)
                     VA_CSB_CALL, i);
             }
         }
-        if (didVol && didBank)
+        if (didVol && didBank && didHold)
             return 0;
         Sleep(1);
     }
 
-    Log("[voice] FAILED to apply patches (vol=%d bank=%d) - unexpected build?",
-        didVol, didBank);
+    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d) - unexpected build?",
+        didVol, didBank, didHold);
     return 0;
 }
 
