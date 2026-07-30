@@ -161,6 +161,62 @@ static const BYTE SIG_SPEECHHOLD[] = {
 static const BYTE PATCH_SPEECHHOLD[] = { 0x90, 0x90 };       /* nop; nop */
 
 /* ------------------------------------------------------------------ */
+/* patch 1c -- F9 toggles room ambience                                */
+/* ------------------------------------------------------------------ */
+
+/* Ambience is unmuted in classic mode by the AmbienceCues fix below, which some
+ * people will want and some won't, so it gets a runtime toggle.
+ *
+ * F9 is safe.  The game's keyboard handler at 0x4020E0 dispatches F1 (menu) and
+ * F10 (version hotswap) and then swallows the whole F1..F12 range:
+ *
+ *   0x402661  cmp edi, 70h      ; F1
+ *   0x402664  jb  ...
+ *   0x402666  cmp edi, 7Bh      ; F12
+ *   0x402669  jbe 0x402B5E      ; -> "unhandled", returns 0
+ *
+ * so F2..F9 and F11 do nothing in-game.  F12 is Steam's screenshot key, so F9 it
+ * is -- unused, and next to F10 where it is easy to remember.  We swallow the
+ * key in our window proc, so the game never sees it either way.
+ *
+ * Muting is done by detouring the instruction that loads the ambience volume:
+ *
+ *   0x441F0E  D9 83 C0 00 00 00   fld dword ptr [ebx+0C0h]   ; 6 bytes
+ *
+ * replaced with "call ourStub; nop".  The stub pushes either the real value or
+ * 0.0 onto the FPU stack, so the game's own volume slider still applies when
+ * ambience is on, and nothing else in the audio update has to change.
+ */
+#define VA_AMBVOL 0x00441F0Eu
+static const BYTE SIG_AMBVOL[] = {
+    0xD9, 0x83, 0xC0, 0x00, 0x00, 0x00,   /* fld dword ptr [ebx+0C0h] */
+    0x51,                                 /* push ecx                 */
+    0xD9, 0x1C, 0x24                      /* fstp dword ptr [esp]     */
+};
+
+#define VK_TOGGLE_AMBIENCE 0x78           /* VK_F9 */
+
+static volatile LONG g_ambienceOn = 1;
+
+/* Replaces the 6-byte fld above.  ebx is the audio manager throughout that
+ * function, so the real value is still one instruction away when enabled. */
+static __declspec(naked) void AmbienceVolStub(void)
+{
+    __asm {
+        pushfd
+        cmp  dword ptr [g_ambienceOn], 0
+        je   silent
+        popfd
+        fld  dword ptr [ebx+0C0h]         /* the instruction we replaced */
+        ret
+    silent:
+        popfd
+        fldz                              /* ambience off */
+        ret
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* patch 2 -- detach the muting RPC preset from the speech soundbank   */
 /* ------------------------------------------------------------------ */
 
@@ -187,18 +243,42 @@ static const BYTE SIG_CSB_CALL[] = { 0x8B, 0x41, 0x24, 0xFF, 0xD0 };
  * SFX and ambience banks in classic mode, which is why only the speech bank is
  * touched.
  */
-static const BYTE RPC_A[]  = { 0x0B,0x00,0x02, 0x3D,0x04,0x00,0x00, 0xB0,0x04,0x00,0x00 };
-static const BYTE RPC_A2[] = { 0x0B,0x00,0x02, 0x99,0x04,0x00,0x00, 0xB0,0x04,0x00,0x00 };
-static const BYTE RPC_B[]  = { 0x0B,0x00,0x02, 0xB0,0x04,0x00,0x00, 0x3D,0x04,0x00,0x00 };
-static const BYTE RPC_B2[] = { 0x0B,0x00,0x02, 0xB0,0x04,0x00,0x00, 0x99,0x04,0x00,0x00 };
+#define RPC22 0x0000043Du    /* NewVersion -> Volume, -96 dB in classic mode */
+#define RPC26 0x00000499u    /* CueVolume  -> Volume, always 0 dB            */
+#define RPC_LO 0x243u        /* valid preset offsets live in [0x243,0x4B0]   */
+#define RPC_HI 0x4B0u
 
-/* XACT validates the 16-bit word at header offset 8 and rejects any edited
- * bank without it.  These are the values for the shipped SpeechCues.xsb; the
- * patched one was found by sweeping all 65536 candidates. */
-#define SPEECH_BANK_SIZE   289474u
-#define SPEECH_HDR_ORIG    0x85BEu
-#define SPEECH_HDR_PATCHED 0xB1CCu
-#define SPEECH_CUE_COUNT   4547
+/* Two banks are silenced in classic mode by RPC22 and want it removed:
+ *
+ *   SpeechCues.xsb    - the voice lines
+ *   AmbienceCues.xsb  - room ambience (the Melee town clock, surf, and so on).
+ *                       Safe to unmute because Ambience is its own XACT
+ *                       category, so it cannot disturb the original music, and
+ *                       there is no "Original" ambience bank to double up
+ *                       against.  Its RPC24 (ducking) reference is kept, so
+ *                       ambience still drops under dialogue.
+ *
+ * SFXCuesNew.xsb and MusicCuesNew.xsb also carry RPC22 and must KEEP it -- they
+ * are the new-content halves of paired banks whose original counterparts play
+ * in classic mode.  Hence the per-bank name gate.
+ *
+ * XACT validates the 16-bit word at header offset 8 and rejects any edited bank
+ * without the right value; each patched bank's word was recovered by sweeping
+ * all 65536 candidates against CreateSoundBank.
+ */
+typedef struct {
+    const char *tag;        /* identifying string inside the bank */
+    DWORD       size;       /* size as shipped                    */
+    WORD        hdrOrig;    /* header word as shipped             */
+    WORD        hdrPatched; /* header word once RPC22 is removed  */
+    int         cues;       /* expected number of edits           */
+} BankFix;
+
+static const BankFix BANKS[] = {
+    { "SpeechCues",   289474u, 0x85BEu, 0xB1CCu, 4547 },
+    { "AmbienceCues",   3899u, 0xF52Eu, 0xECDCu,   30 }
+};
+#define BANK_COUNT 2
 
 #define MAX_BANK_SIZE (16u * 1024u * 1024u)   /* bound before allocating */
 
@@ -206,18 +286,27 @@ typedef HRESULT (WINAPI *PFN_CreateSoundBank)(void *pEngine, const void *pv,
                                               DWORD size, DWORD f1, DWORD f2,
                                               void **ppSB);
 
-static int RepointSpeechRpcs(BYTE *buf, unsigned int size)
+/* Swap RPC22 for RPC26 wherever it appears in a two-preset RPC block.  Both
+ * orderings occur, and both banks use it, so this is written generically.
+ * Requiring the other preset to be a valid offset too keeps it from matching
+ * unrelated data that happens to start with 0B 00 02. */
+static int RepointRpc22(BYTE *buf, unsigned int size)
 {
     SIZE_T i;
     int n = 0;
     for (i = 0; i + 11 <= size; i++) {
+        DWORD a, b;
         if (buf[i] != 0x0B || buf[i + 1] != 0x00 || buf[i + 2] != 0x02)
             continue;
-        if (MemCmp(buf + i, RPC_A, 11) == 0) {
-            MemCpy(buf + i, RPC_A2, 11);
+        a = *(DWORD *)(buf + i + 3);
+        b = *(DWORD *)(buf + i + 7);
+        if (a < RPC_LO || a > RPC_HI || b < RPC_LO || b > RPC_HI)
+            continue;
+        if (a == RPC22) {
+            *(DWORD *)(buf + i + 3) = RPC26;
             n++;
-        } else if (MemCmp(buf + i, RPC_B, 11) == 0) {
-            MemCpy(buf + i, RPC_B2, 11);
+        } else if (b == RPC22) {
+            *(DWORD *)(buf + i + 7) = RPC26;
             n++;
         }
     }
@@ -305,17 +394,29 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
                                         DWORD f2, void **ppSB)
 {
     const BYTE *src = (const BYTE *)pv;
+    const BankFix *fix = NULL;
     BYTE *work;
     WORD orig, cand = 0;
     HRESULT hr;
-    int n;
+    int n, bi;
     BOOL haveCand = FALSE;
 
-    /* SFXCuesNew.xsb contains the same 11-byte pattern 207 times and must keep
-     * its mute, hence the bank-name check. */
     if (!src || size < 0x40 || size > MAX_BANK_SIZE ||
-        MemCmp(src, "SDBK", 4) != 0 ||
-        !MemFind(src, size, (const BYTE *)"SpeechCues", 10))
+        MemCmp(src, "SDBK", 4) != 0)
+        return real(pEngine, pv, size, f1, f2, ppSB);
+
+    /* Identify the bank by name.  SFXCuesNew.xsb and MusicCuesNew.xsb carry the
+     * same RPC22 blocks but must keep them, so only listed banks are touched. */
+    for (bi = 0; bi < BANK_COUNT; bi++) {
+        SIZE_T tl = 0;
+        while (BANKS[bi].tag[tl])
+            tl++;
+        if (MemFind(src, size, (const BYTE *)BANKS[bi].tag, tl)) {
+            fix = &BANKS[bi];
+            break;
+        }
+    }
+    if (!fix)
         return real(pEngine, pv, size, f1, f2, ppSB);
 
     if (!ppSB)      /* no way to tell success from failure; leave it alone */
@@ -329,20 +430,20 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
         return real(pEngine, pv, size, f1, f2, ppSB);
     MemCpy(work, src, size);
 
-    n = RepointSpeechRpcs(work, size);
+    n = RepointRpc22(work, size);
     if (n == 0) {
         VirtualFree(work, 0, MEM_RELEASE);
         return real(pEngine, pv, size, f1, f2, ppSB);
     }
 
     /* Only trust the hard-coded header word for the exact bank it came from. */
-    if (size == SPEECH_BANK_SIZE && orig == SPEECH_HDR_ORIG) {
-        cand = SPEECH_HDR_PATCHED;
+    if (size == fix->size && orig == fix->hdrOrig && fix->hdrPatched) {
+        cand = fix->hdrPatched;
         haveCand = TRUE;
     } else if (CacheLookup(size, orig, &cand)) {
         haveCand = TRUE;
-        Log("[voice] unrecognised bank (size=%u orig=0x%04X); using cached "
-            "header 0x%04X", size, orig, cand);
+        Log("[voice] %s: unrecognised (size=%u orig=0x%04X); cached header 0x%04X",
+            fix->tag, size, orig, cand);
     }
 
     if (haveCand) {
@@ -351,8 +452,8 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
         *ppSB = NULL;
         hr = real(pEngine, work, size, f1, f2, ppSB);
         if (hr >= 0 && *ppSB) {
-            Log("[voice] speech bank OK: RPC22 detached from %d/%d cues",
-                n, SPEECH_CUE_COUNT);
+            Log("[voice] %s OK: RPC22 detached from %d/%d cues",
+                fix->tag, n, fix->cues);
             return hr;                  /* work intentionally not freed */
         }
     }
@@ -360,8 +461,8 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
     if (SweepEnabled()) {
         DWORD t0 = GetTickCount();
         DWORD c;
-        Log("[voice] sweeping header word for bank size=%u orig=0x%04X",
-            size, orig);
+        Log("[voice] sweeping header word for %s (size=%u orig=0x%04X)",
+            fix->tag, size, orig);
         for (c = 0; c <= 0xFFFF; c++) {
             work[8] = (BYTE)(c & 0xFF);
             work[9] = (BYTE)((c >> 8) & 0xFF);
@@ -377,17 +478,17 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
         Log("[voice] sweep exhausted after %u ms - bank not patchable",
             GetTickCount() - t0);
     } else if (!haveCand) {
-        Log("[voice] unrecognised speech bank (size=%u orig=0x%04X). Running "
+        Log("[voice] %s unrecognised (size=%u orig=0x%04X). Running "
             "unpatched. To calibrate, create the file %%TEMP%%\\MISEVoiceSweep "
-            "and relaunch once (~45 s, result is cached).", size, orig);
+            "and relaunch once (result is cached).", fix->tag, size, orig);
     }
 
     /* Give up cleanly: hand XACT the game's original, untouched buffer. */
     VirtualFree(work, 0, MEM_RELEASE);
     *ppSB = NULL;
     hr = real(pEngine, pv, size, f1, f2, ppSB);
-    Log("[voice] speech bank left unpatched (hr=0x%08X); voice stays muted in "
-        "classic mode", (DWORD)hr);
+    Log("[voice] %s left unpatched (hr=0x%08X); it stays muted in classic mode",
+        fix->tag, (DWORD)hr);
     return hr;
 }
 
@@ -448,6 +549,43 @@ static BOOL Readable(DWORD va, SIZE_T len)
     return (DWORD)((BYTE *)mbi.BaseAddress + mbi.RegionSize) >= va + len;
 }
 
+/* ------------------------------------------------------------------ */
+/* window subclass, purely to receive the F9 toggle                    */
+/* ------------------------------------------------------------------ */
+
+/* A process-local subclass of the game's own window -- deliberately NOT a
+ * system-wide SetWindowsHookEx keyboard hook, which would be unnecessary here
+ * and indistinguishable from a keylogger.  Nothing is recorded or persisted:
+ * one key is inspected and swallowed, everything else passes straight through. */
+
+static WNDPROC g_origWndProc = NULL;
+
+static LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == VK_TOGGLE_AMBIENCE) {
+        LONG was = InterlockedExchange(&g_ambienceOn, g_ambienceOn ? 0 : 1);
+        Log("[voice] F9: room ambience %s", was ? "OFF" : "ON");
+        return 0;                       /* swallow it */
+    }
+    return CallWindowProcA(g_origWndProc, hwnd, msg, wp, lp);
+}
+
+static BOOL InstallSubclass(void)
+{
+    HWND hwnd;
+    if (g_origWndProc)
+        return TRUE;
+    hwnd = FindWindowA("RemonkeyedMainWindow", NULL);
+    if (!hwnd)
+        return FALSE;
+    g_origWndProc = (WNDPROC)(LONG_PTR)
+        SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)OurWndProc);
+    if (!g_origWndProc)
+        return FALSE;
+    Log("[voice] F9 ambience toggle armed (hwnd 0x%08X)", (DWORD)(UINT_PTR)hwnd);
+    return TRUE;
+}
+
 /*
  * MISE.exe is wrapped in Steam's CEG DRM: .text is encrypted on disk and
  * decrypted by the stub inside the exe entry point, which runs *after* every
@@ -455,13 +593,15 @@ static BOOL Readable(DWORD va, SIZE_T len)
  * wait for the expected bytes to appear.  Verifying the signature first also
  * means an unexpected build is left alone rather than corrupted.
  *
- * In practice both land ~13 ms in, before the game creates its own threads or
- * loads any soundbank, so neither instruction can be executing while rewritten.
+ * The code patches land ~13 ms in, before the game creates its own threads or
+ * loads any soundbank.  The window does not exist that early, so the subclass is
+ * installed later in the same loop.
  */
 static DWORD WINAPI PatchThread(LPVOID unused)
 {
     int i;
     BOOL didVol = FALSE, didBank = FALSE, didHold = FALSE;
+    BOOL didAmb = FALSE, didHook = FALSE;
 
     (void)unused;
 
@@ -499,13 +639,29 @@ static DWORD WINAPI PatchThread(LPVOID unused)
                     VA_CSB_CALL, i);
             }
         }
-        if (didVol && didBank && didHold)
+        if (!didAmb && Readable(VA_AMBVOL, sizeof(SIG_AMBVOL)) &&
+            MemCmp((const void *)VA_AMBVOL, SIG_AMBVOL, sizeof(SIG_AMBVOL)) == 0) {
+            BYTE det[6];
+            det[0] = 0xE8;                          /* call rel32 */
+            *(DWORD *)(det + 1) =
+                (DWORD)((BYTE *)AmbienceVolStub - (BYTE *)(VA_AMBVOL + 5));
+            det[5] = 0x90;                          /* nop, to fill 6 bytes */
+            if (WriteCode(VA_AMBVOL, det, 6)) {
+                didAmb = TRUE;
+                Log("[voice] ambience volume hooked @0x%08X (t=%d ms)", VA_AMBVOL, i);
+            }
+        }
+        /* the game window does not exist as early as the code patches */
+        if (!didHook)
+            didHook = InstallSubclass();
+
+        if (didVol && didBank && didHold && didAmb && didHook)
             return 0;
         Sleep(1);
     }
 
-    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d) - unexpected build?",
-        didVol, didBank, didHold);
+    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d amb=%d hook=%d)"
+        " - unexpected build?", didVol, didBank, didHold, didAmb, didHook);
     return 0;
 }
 
