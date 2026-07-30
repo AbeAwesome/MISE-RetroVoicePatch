@@ -6,7 +6,8 @@
  *  game normally silences.  Two independent mutes have to be undone: an XACT
  *  RPC preset attached to every speech cue, and a per-frame write to the Speech
  *  category volume.  A third patch lets subtitles wait for the voice line, which
- *  the engine already supports but disables in classic mode.  Everything is
+ *  the engine already supports but disables in classic mode.  A fourth restores
+ *  the per-line dialogue skip the Special Edition dropped.  Everything is
  *  patched in memory, so no game file changes.
  *
  *  Full write-up, including how the addresses and constants were derived, is in
@@ -18,6 +19,11 @@
 
 #include <windows.h>
 #include <stdarg.h>
+
+/* The compiler emits a reference to this the moment a float appears (the fade
+ * ramp below); with /NODEFAULTLIB there is no CRT to define it.  Its value is
+ * never read -- the symbol just has to exist. */
+int _fltused = 1;
 
 /* ------------------------------------------------------------------ */
 /* helpers (no CRT)                                                    */
@@ -214,6 +220,168 @@ static __declspec(naked) void AmbienceVolStub(void)
         fldz                              /* ambience off */
         ret
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* patch 1d -- per-line dialogue skip (comma / period / right mouse)   */
+/* ------------------------------------------------------------------ */
+
+/* The original SCUMM release let you cut a line short and move straight to the
+ * next one.  The Special Edition dropped it: Backspace and Delete are wired to
+ * a whole-conversation skip instead, and nothing reads '.' any more.
+ *
+ * A line is described by two engine globals:
+ *
+ *   5B996Ch  dword, talk id of the voice line playing (0 = none).  Set by
+ *            patch 1b above; the message tick at 0x498BE0 will not expire a
+ *            subtitle whose talk id matches it.
+ *   5C2012h  word, the subtitle's own countdown, ticked down every frame.
+ *
+ * Zeroing both is exactly the state the engine reaches when a line ends
+ * normally, so the script advances through its own path -- no faking of script
+ * state, and the next line plays in full.  Verified live: with a line playing,
+ * clearing both made the following line start ~0.6 s later, same as an
+ * unskipped line.
+ *
+ * The voice itself has to be silenced separately or it would talk over the next
+ * line.  Cutting a waveform dead mid-word clicks, so the Speech category is
+ * ramped to zero over FADE_MS and only then stopped.  The ramp rides on the
+ * game's own per-frame volume write:
+ *
+ *   0x441EA9  F3 0F 11 04 24   movss dword ptr [esp], xmm0   ; volume argument
+ *   0x441EAE  52 50            push edx / push eax           ; category, engine
+ *   0x441EB0  8B 41 4C         mov eax, [ecx+4Ch]            ; SetVolume
+ *
+ * That store is exactly 5 bytes, so it becomes a call to a stub that performs
+ * the store and then scales it.  Only the Speech category passes through here;
+ * the write just below it at 0x441EDF is a different category.
+ */
+#define VA_SPEECHVOL_STORE 0x00441EA1u
+static const BYTE SIG_SPEECHVOL_STORE[] = {
+    0xF2, 0x0F, 0x59, 0xC1,               /* mulsd    xmm0, xmm1        */
+    0x66, 0x0F, 0x5A, 0xC0,               /* cvtpd2ps xmm0, xmm0        */
+    0xF3, 0x0F, 0x11, 0x04, 0x24,         /* movss    [esp], xmm0  <--  */
+    0x52, 0x50,                           /* push edx / push eax        */
+    0x8B, 0x41, 0x4C,                     /* mov eax, [ecx+4Ch]         */
+    0xFF, 0xD0                            /* call eax                   */
+};
+#define SPEECHVOL_STORE_OFS 8
+
+/* audio manager -> XACT engine at +70h, Speech category index at +2A2h */
+#define VA_AUDIOMGR_PTR 0x005B9888u
+#define AUDIOMGR_ENGINE 0x70u
+#define AUDIOMGR_SPEECHCAT 0x2A2u
+
+#define VA_TALK_ID    0x005B996Cu     /* dword: voice line id, 0 = none */
+#define VA_TALK_DELAY 0x005C2012u     /* word:  subtitle countdown      */
+
+#define VK_SKIP_COMMA  0xBC           /* VK_OEM_COMMA  */
+#define VK_SKIP_PERIOD 0xBE           /* VK_OEM_PERIOD */
+
+#define FADE_MS 80u                   /* ramp length before the cue is stopped */
+
+/* IXACT3Engine vtable: CreateSoundBank is index 9 (used at 0x440FCD as
+ * [ecx+24h]) and SetVolume is index 19 ([ecx+4Ch] above), which pins Stop at
+ * index 18. */
+#define XACT_VT_STOP 18
+#define XACT_STOP_IMMEDIATE 1u
+
+static volatile LONG g_fadeStart = 0;      /* GetTickCount at skip, 0 = idle */
+static float         g_speechGain = 1.0f;  /* read by the stub every frame   */
+static BOOL          g_haveFadeHook = FALSE;
+
+static BOOL Readable(DWORD va, SIZE_T len);    /* defined with the plumbing */
+
+typedef HRESULT (__stdcall *PFN_XactStop)(void *self, DWORD cat, DWORD flags);
+
+static void StopSpeechCategory(void)
+{
+    BYTE *mgr = *(BYTE **)VA_AUDIOMGR_PTR;
+    void *eng;
+    void **vt;
+
+    if (!mgr)
+        return;
+    eng = *(void **)(mgr + AUDIOMGR_ENGINE);
+    if (!eng)
+        return;
+    vt = *(void ***)eng;
+    if (!vt || !vt[XACT_VT_STOP])
+        return;
+    ((PFN_XactStop)vt[XACT_VT_STOP])(eng,
+        (DWORD)*(WORD *)(mgr + AUDIOMGR_SPEECHCAT), XACT_STOP_IMMEDIATE);
+}
+
+/* Called once per frame from the stub below, on the game's own thread. */
+static void UpdateSpeechGain(void)
+{
+    LONG start = g_fadeStart;
+    DWORD dt;
+
+    if (!start) {
+        g_speechGain = 1.0f;
+        return;
+    }
+    dt = GetTickCount() - (DWORD)start;
+    if (dt < FADE_MS) {
+        g_speechGain = 1.0f - (float)dt / (float)FADE_MS;
+        return;
+    }
+    StopSpeechCategory();
+    InterlockedExchange(&g_fadeStart, 0);
+    g_speechGain = 1.0f;
+}
+
+/* Replaces "movss [esp], xmm0".  Our call pushed a return address, so the
+ * argument slot the game is building sits one dword further up.  The C call is
+ * free to clobber xmm registers because the value is reloaded from that slot
+ * afterwards; eax/ecx/edx must survive, hence pushad. */
+static __declspec(naked) void SpeechVolStub(void)
+{
+    __asm {
+        movss dword ptr [esp+4], xmm0     /* the store we replaced */
+        pushfd
+        pushad
+        call UpdateSpeechGain
+        /* pushad(32) + pushfd(4) + return address(4) = 40 */
+        movss xmm0, dword ptr [esp+40]
+        mulss xmm0, dword ptr [g_speechGain]
+        movss dword ptr [esp+40], xmm0
+        popad
+        popfd
+        ret
+    }
+}
+
+/*
+ * Returns TRUE if a line was actually skipped, so the caller can swallow the
+ * key or click; anything else is passed on to the game untouched.  That matters
+ * for the right mouse button, which the game tracks in its own button mask.
+ */
+static BOOL TrySkipLine(const char *how)
+{
+    DWORD tid;
+    WORD delay;
+
+    if (!Readable(VA_TALK_ID, 4) || !Readable(VA_TALK_DELAY, 2))
+        return FALSE;
+
+    tid = *(volatile DWORD *)VA_TALK_ID;
+    delay = *(volatile WORD *)VA_TALK_DELAY;
+    if (!tid && !delay)
+        return FALSE;               /* nothing is being said right now */
+
+    if (tid) {
+        if (g_haveFadeHook)
+            InterlockedExchange(&g_fadeStart, (LONG)GetTickCount());
+        else
+            StopSpeechCategory();   /* no ramp available; cut it cleanly */
+    }
+
+    *(volatile DWORD *)VA_TALK_ID = 0;
+    *(volatile WORD *)VA_TALK_DELAY = 0;
+    Log("[voice] %s: line skipped (talkid=%u, subtitle=%u)", how, tid, delay);
+    return TRUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -562,11 +730,26 @@ static WNDPROC g_origWndProc = NULL;
 
 static LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == VK_TOGGLE_AMBIENCE) {
-        LONG was = InterlockedExchange(&g_ambienceOn, g_ambienceOn ? 0 : 1);
-        Log("[voice] F9: room ambience %s", was ? "OFF" : "ON");
-        return 0;                       /* swallow it */
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+        if (wp == VK_TOGGLE_AMBIENCE) {
+            LONG was = InterlockedExchange(&g_ambienceOn, g_ambienceOn ? 0 : 1);
+            Log("[voice] F9: room ambience %s", was ? "OFF" : "ON");
+            return 0;                   /* swallow it */
+        }
+        /* The game maps unhandled keys through MapVirtualKey into its SCUMM
+         * key global, but nothing there reads ',' or '.', so swallowing them
+         * costs nothing. */
+        if (wp == VK_SKIP_COMMA || wp == VK_SKIP_PERIOD) {
+            if (TrySkipLine(wp == VK_SKIP_COMMA ? "," : "."))
+                return 0;
+            return 0;                   /* still inert; do not pass it on */
+        }
     }
+    /* Only swallowed when it actually skipped, so the button keeps its normal
+     * meaning everywhere else. */
+    if (msg == WM_RBUTTONDOWN && TrySkipLine("right click"))
+        return 0;
+
     return CallWindowProcA(g_origWndProc, hwnd, msg, wp, lp);
 }
 
@@ -601,7 +784,7 @@ static DWORD WINAPI PatchThread(LPVOID unused)
 {
     int i;
     BOOL didVol = FALSE, didBank = FALSE, didHold = FALSE;
-    BOOL didAmb = FALSE, didHook = FALSE;
+    BOOL didAmb = FALSE, didHook = FALSE, didFade = FALSE;
 
     (void)unused;
 
@@ -651,17 +834,32 @@ static DWORD WINAPI PatchThread(LPVOID unused)
                 Log("[voice] ambience volume hooked @0x%08X (t=%d ms)", VA_AMBVOL, i);
             }
         }
+        if (!didFade && Readable(VA_SPEECHVOL_STORE, sizeof(SIG_SPEECHVOL_STORE)) &&
+            MemCmp((const void *)VA_SPEECHVOL_STORE, SIG_SPEECHVOL_STORE,
+                   sizeof(SIG_SPEECHVOL_STORE)) == 0) {
+            BYTE call5[5];
+            call5[0] = 0xE8;                    /* call rel32 */
+            *(DWORD *)(call5 + 1) = (DWORD)((BYTE *)SpeechVolStub -
+                (BYTE *)(VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS + 5));
+            if (WriteCode(VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS, call5, 5)) {
+                didFade = TRUE;
+                g_haveFadeHook = TRUE;
+                Log("[voice] speech fade hooked @0x%08X (t=%d ms)",
+                    VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS, i);
+            }
+        }
         /* the game window does not exist as early as the code patches */
         if (!didHook)
             didHook = InstallSubclass();
 
-        if (didVol && didBank && didHold && didAmb && didHook)
+        if (didVol && didBank && didHold && didAmb && didHook && didFade)
             return 0;
         Sleep(1);
     }
 
-    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d amb=%d hook=%d)"
-        " - unexpected build?", didVol, didBank, didHold, didAmb, didHook);
+    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d amb=%d hook=%d"
+        " fade=%d) - unexpected build?",
+        didVol, didBank, didHold, didAmb, didHook, didFade);
     return 0;
 }
 
