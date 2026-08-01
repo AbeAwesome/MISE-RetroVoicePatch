@@ -6,7 +6,7 @@ In 2009, ***The Secret of Monkey Island: Special Edition*** was released with (t
 
 That said, hot-swapping to "classic mode" disables the voice over; while the "contemporary art style" is an *acquired taste*, to say the least. To this day, every time I wanted to play the game, I had to use the ***Monkey Island Ultimate Talkie Edition***, extract the voice files, and run the game using ***ScummVM***; which isn't a huge deal... but it requires installing extra software and takes up between 150 to 800 MB of disk space.
 
-This patch is a **9.5 KB** proxy DLL that prevents the Steam executable from muting the voice-over when "*classic mode*" is toggled on, and SE's ambient sounds can be turned on as well. For now, the rest of the sound effects are not affected (I believe Talkie Edition does keep some of the cleaner SE files, my patch currently doesn't).
+This patch is a **10 KB** proxy DLL that prevents the Steam executable from muting the voice-over when "*classic mode*" is toggled on. It also allows the **optional** enabling of SE's ambient sounds and some extra sound-effects.
 
 ## User Guide
 ### Installation
@@ -15,23 +15,21 @@ This patch is a **9.5 KB** proxy DLL that prevents the Steam executable from mut
 
 Simply delete `d3d9.dll` to disable/uninstall the patch.
 
-### Hotkeys
-- **F9** toggles __ambient sounds__
-- **,**, **.**, and the **Right Mouse Button** skip dialog line-by-line.
+### Hotkeys (*Classic Mode only*)
+- **F9** toggles *ambient sounds*
+- `,`, `.`, and the `Right Mouse Button` skip dialog line-by-line.
+- `Mouse Wheel` scrolls through dialog options.
 
 
-## Caveats
+## Notes
+### Caveats
 - I only tested this on the current Steam patch, I don't own the GOG version to test, and I no longer have my retail DVD.
 - I only develop in JavaScript or 6502 Assembly, so apart from my diagnosis of the problem, all the work and code was done by a Claude Opus 5 agent. It's very possible that there are mistakes or oversights, that's why I am making the code public, so that people who know better can audit it.
-- Checking the .dll using Virus Total, between 3 and 5 vendors flag it as potentially malicious, including Microsoft in some cases. This is a false-positive based on heuristics, but you shouldn't trust me (again, that's why the code is public).
+- Checking the .dll using VirusTotal, between 3 and 5 vendors flag it as potentially malicious, including Microsoft in some cases. This is a false-positive based on heuristics, but you shouldn't trust me (again, that's why the code is public).
+- Check [`IMPLEMENTATION.md`](IMPLEMENTATION.md) to read implementation notes from the Opus 5 AI agent. *Written by AI, like the code.*
 
-## Implementation Notes
-*this section was written by AI*
-
-The Special Edition mutes dialogue in classic mode in **two** independent places, and both have to be undone:
-
-1. **Audio data.** All 4,547 cues in `SpeechCues.xsb` carry an XACT curve that returns −96 dB when the game's `NewVersion` variable is 0 — which is exactly what classic mode sets it to. That curve can't simply be flattened, because it's also what mutes the *new* music and sound effects: the game fires every cue into both the "New" and "Original" soundbanks and lets the curve decide which one you hear. So it's detached from the speech bank alone, swapped for a curve that evaluates to exactly 0 dB.
-2. **Code.** `MISE.exe` re-sets the Speech category volume to `(1 − classicBlend) × voiceVolume` every frame. A three-byte instruction patch removes that factor.
-3. **v0.4 | Subtitle timing fix.** Classic mode drove subtitles off SCUMM's own text timer while the voice played independently. The engine already holds a subtitle whose talk id matches the currently-speaking line, but storing that id was gated on the classic-mode flag. Removing the gate lets the existing logic run in both modes.
-4. **v0.5 | Room ambience.** The same curve also silences ambient room sounds in classic mode — the Melee Island town clock, the surf, and so on. Ambience is its own XACT category with no "Original" counterpart, so restoring it can't double up against the original music; its ducking curve is kept, so ambience still drops under dialogue. **F9** turns ambience on and off at runtime.
-6. **v0.5.2 | Line skip.** The original release let you cut a line short and move to the next one; the Special Edition dropped it, leaving only Backspace/Delete to skip a whole conversation. `,`, `.` or right-click now put the engine in the exact state it reaches when a line ends by itself, so the script advances through its own path — and the voice is faded out over 80 ms rather than cut dead.
+### Changelog
+- **v0.6.5** — Extra SE sound-effects in classic mode (`F9`). Dialog options scrolling (`Mouse Wheel`). Fixed/adjusted `F9` and dialog-skip behavior.
+- **v0.5.2** — Ambient sounds in classic mode (`F9`). Line-skip restored (`,`, `.`, or `RMB`).
+- **v0.4** — Fixed subtitle/voice de-sync.
+- **v0.3** — First public release: voice acting in classic mode.

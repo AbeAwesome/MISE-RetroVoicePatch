@@ -7,8 +7,10 @@
  *  RPC preset attached to every speech cue, and a per-frame write to the Speech
  *  category volume.  A third patch lets subtitles wait for the voice line, which
  *  the engine already supports but disables in classic mode.  A fourth restores
- *  the per-line dialogue skip the Special Edition dropped.  Everything is
- *  patched in memory, so no game file changes.
+ *  the per-line dialogue skip the Special Edition dropped, and a fifth lets the
+ *  mouse wheel page through long dialogue lists.  F9 adds the Special
+ *  Edition's ambience and its sound effects that have no original
+ *  counterpart.  Everything is patched in memory, so no game file changes.
  *
  *  Full write-up, including how the addresses and constants were derived, is in
  *  the project notes.  Comments below cover only what is needed to change this
@@ -19,11 +21,6 @@
 
 #include <windows.h>
 #include <stdarg.h>
-
-/* The compiler emits a reference to this the moment a float appears (the fade
- * ramp below); with /NODEFAULTLIB there is no CRT to define it.  Its value is
- * never read -- the symbol just has to exist. */
-int _fltused = 1;
 
 /* ------------------------------------------------------------------ */
 /* helpers (no CRT)                                                    */
@@ -185,39 +182,68 @@ static const BYTE PATCH_SPEECHHOLD[] = { 0x90, 0x90 };       /* nop; nop */
  * is -- unused, and next to F10 where it is easy to remember.  We swallow the
  * key in our window proc, so the game never sees it either way.
  *
- * Muting is done by detouring the instruction that loads the ambience volume:
+ * Where the muting happens matters, because of a latent bug in the game.  The
+ * audio update computes one volume, hands it to SetVolume for the Ambience
+ * category, and then -- when the branch at 0x441F76 is taken, which it always is
+ * in practice -- hands the *same stack slot* to SetVolume for the SFX category
+ * without recomputing it:
  *
- *   0x441F0E  D9 83 C0 00 00 00   fld dword ptr [ebx+0C0h]   ; 6 bytes
+ *   E-4   0x441F14  push ecx                    ; makes the argument slot
+ *   E-4   0x441F29  movss [esp+20h], xmm0       ; writes E+1Ch  <- shared slot
+ *   E-12  0x441F36  push edx / push eax
+ *   E     0x441F3B  call SetVolume              ; stdcall, ret 12 -> esp back to E
+ *   E     0x441F76  jb 0x441FC8                 ; taken: [mgr+0CCh] is -1, limit 0
+ *   --              movss [esp+1Ch], xmm0       ; the SFX volume: SKIPPED
+ *   E     0x441FCB  fld [esp+1Ch]               ; reads E+1Ch -- the same dword
  *
- * replaced with "call ourStub; nop".  The stub pushes either the real value or
- * 0.0 onto the FPU stack, so the game's own volume slider still applies when
- * ambience is on, and nothing else in the audio update has to change.
+ * Stock MISE never notices: ambience and SFX are both 100, so reusing the slot
+ * changes nothing.  Any patch that lowers the ambience volume, though, lowers
+ * the SFX volume with it and silences every sound effect in the game.  Earlier
+ * versions of this patch did exactly that by replacing the "fld [ebx+0C0h]" at
+ * 0x441F0E, and the symptom was blamed on everything except the real cause.
+ *
+ * So the value the game stores must be left alone, and only the copy that
+ * becomes SetVolume's argument is muted.  That copy is these 7 bytes:
+ *
+ *   0x441F2F  D9 44 24 20   fld  dword ptr [esp+20h]   ; read the shared slot
+ *   0x441F33  D9 1C 24      fstp dword ptr [esp]       ; into the argument slot
+ *
+ * replaced with "call ourStub; nop; nop".  xmm0 is dead here (0x441F49 reloads
+ * it) and an fld/fstp pair is swapped for code using no x87 at all, so the FPU
+ * stack is left exactly as it was.
  */
-#define VA_AMBVOL 0x00441F0Eu
-static const BYTE SIG_AMBVOL[] = {
-    0xD9, 0x83, 0xC0, 0x00, 0x00, 0x00,   /* fld dword ptr [ebx+0C0h] */
-    0x51,                                 /* push ecx                 */
-    0xD9, 0x1C, 0x24                      /* fstp dword ptr [esp]     */
+#define VA_AMBARG 0x00441F1Du
+static const BYTE SIG_AMBARG[] = {
+    0x0F, 0xB7, 0x93, 0xA0, 0x02, 0x00, 0x00,   /* movzx edx,[ebx+2A0h] Ambience */
+    0x8B, 0x43, 0x70,                           /* mov eax,[ebx+70h]  engine     */
+    0x8B, 0x08,                                 /* mov ecx,[eax]      vtable     */
+    0xF3, 0x0F, 0x11, 0x44, 0x24, 0x20,         /* movss [esp+20h],xmm0          */
+    0xD9, 0x44, 0x24, 0x20,                     /* fld  [esp+20h]        <-- patched */
+    0xD9, 0x1C, 0x24,                           /* fstp [esp]            <-- patched */
+    0x52, 0x50,                                 /* push edx / push eax           */
+    0x8B, 0x41, 0x4C,                           /* mov eax,[ecx+4Ch]  SetVolume  */
+    0xFF, 0xD0                                  /* call eax                      */
 };
+#define AMBARG_PATCH_OFS 18
 
 #define VK_TOGGLE_AMBIENCE 0x78           /* VK_F9 */
 
 static volatile LONG g_ambienceOn = 1;
 
-/* Replaces the 6-byte fld above.  ebx is the audio manager throughout that
- * function, so the real value is still one instruction away when enabled. */
-static __declspec(naked) void AmbienceVolStub(void)
+/* Our call pushed a return address, so the shared slot the game wrote at
+ * [esp+20h] is now at [esp+24h], and the argument slot it is copying into is at
+ * [esp+4].  Only the latter is ever written here. */
+static __declspec(naked) void AmbienceArgStub(void)
 {
     __asm {
+        movss xmm0, dword ptr [esp+24h]   /* the value the game computed */
         pushfd
-        cmp  dword ptr [g_ambienceOn], 0
-        je   silent
+        cmp   dword ptr [g_ambienceOn], 0
+        jne   keep
+        xorps xmm0, xmm0                  /* ambience off */
+    keep:
         popfd
-        fld  dword ptr [ebx+0C0h]         /* the instruction we replaced */
-        ret
-    silent:
-        popfd
-        fldz                              /* ambience off */
+        movss dword ptr [esp+4], xmm0     /* argument only; slot left intact */
         ret
     }
 }
@@ -244,29 +270,15 @@ static __declspec(naked) void AmbienceVolStub(void)
  * unskipped line.
  *
  * The voice itself has to be silenced separately or it would talk over the next
- * line.  Cutting a waveform dead mid-word clicks, so the Speech category is
- * ramped to zero over FADE_MS and only then stopped.  The ramp rides on the
- * game's own per-frame volume write:
- *
- *   0x441EA9  F3 0F 11 04 24   movss dword ptr [esp], xmm0   ; volume argument
- *   0x441EAE  52 50            push edx / push eax           ; category, engine
- *   0x441EB0  8B 41 4C         mov eax, [ecx+4Ch]            ; SetVolume
- *
- * That store is exactly 5 bytes, so it becomes a call to a stub that performs
- * the store and then scales it.  Only the Speech category passes through here;
- * the write just below it at 0x441EDF is a different category.
+ * line, and that is done the moment the key is pressed rather than on a timer.
+ * An earlier version ramped the Speech category down over 80 ms first, to avoid
+ * clicking on a waveform cut mid-word.  It was not worth it: the stop is
+ * category-wide, so a deferred stop silences whatever happens to be playing when
+ * it fires, and scripts differ wildly in how soon they reach the next line --
+ * an insult swordfight leaves half a second, an ordinary exchange none at all.
+ * Stopping immediately removes the window entirely, and with it a code hook, two
+ * globals and the only floating point in the file.
  */
-#define VA_SPEECHVOL_STORE 0x00441EA1u
-static const BYTE SIG_SPEECHVOL_STORE[] = {
-    0xF2, 0x0F, 0x59, 0xC1,               /* mulsd    xmm0, xmm1        */
-    0x66, 0x0F, 0x5A, 0xC0,               /* cvtpd2ps xmm0, xmm0        */
-    0xF3, 0x0F, 0x11, 0x04, 0x24,         /* movss    [esp], xmm0  <--  */
-    0x52, 0x50,                           /* push edx / push eax        */
-    0x8B, 0x41, 0x4C,                     /* mov eax, [ecx+4Ch]         */
-    0xFF, 0xD0                            /* call eax                   */
-};
-#define SPEECHVOL_STORE_OFS 8
-
 /* audio manager -> XACT engine at +70h, Speech category index at +2A2h */
 #define VA_AUDIOMGR_PTR 0x005B9888u
 #define AUDIOMGR_ENGINE 0x70u
@@ -278,17 +290,11 @@ static const BYTE SIG_SPEECHVOL_STORE[] = {
 #define VK_SKIP_COMMA  0xBC           /* VK_OEM_COMMA  */
 #define VK_SKIP_PERIOD 0xBE           /* VK_OEM_PERIOD */
 
-#define FADE_MS 80u                   /* ramp length before the cue is stopped */
-
 /* IXACT3Engine vtable: CreateSoundBank is index 9 (used at 0x440FCD as
  * [ecx+24h]) and SetVolume is index 19 ([ecx+4Ch] above), which pins Stop at
  * index 18. */
 #define XACT_VT_STOP 18
 #define XACT_STOP_IMMEDIATE 1u
-
-static volatile LONG g_fadeStart = 0;      /* GetTickCount at skip, 0 = idle */
-static float         g_speechGain = 1.0f;  /* read by the stub every frame   */
-static BOOL          g_haveFadeHook = FALSE;
 
 static BOOL Readable(DWORD va, SIZE_T len);    /* defined with the plumbing */
 
@@ -312,47 +318,6 @@ static void StopSpeechCategory(void)
         (DWORD)*(WORD *)(mgr + AUDIOMGR_SPEECHCAT), XACT_STOP_IMMEDIATE);
 }
 
-/* Called once per frame from the stub below, on the game's own thread. */
-static void UpdateSpeechGain(void)
-{
-    LONG start = g_fadeStart;
-    DWORD dt;
-
-    if (!start) {
-        g_speechGain = 1.0f;
-        return;
-    }
-    dt = GetTickCount() - (DWORD)start;
-    if (dt < FADE_MS) {
-        g_speechGain = 1.0f - (float)dt / (float)FADE_MS;
-        return;
-    }
-    StopSpeechCategory();
-    InterlockedExchange(&g_fadeStart, 0);
-    g_speechGain = 1.0f;
-}
-
-/* Replaces "movss [esp], xmm0".  Our call pushed a return address, so the
- * argument slot the game is building sits one dword further up.  The C call is
- * free to clobber xmm registers because the value is reloaded from that slot
- * afterwards; eax/ecx/edx must survive, hence pushad. */
-static __declspec(naked) void SpeechVolStub(void)
-{
-    __asm {
-        movss dword ptr [esp+4], xmm0     /* the store we replaced */
-        pushfd
-        pushad
-        call UpdateSpeechGain
-        /* pushad(32) + pushfd(4) + return address(4) = 40 */
-        movss xmm0, dword ptr [esp+40]
-        mulss xmm0, dword ptr [g_speechGain]
-        movss dword ptr [esp+40], xmm0
-        popad
-        popfd
-        ret
-    }
-}
-
 /*
  * Returns TRUE if a line was actually skipped, so the caller can swallow the
  * key or click; anything else is passed on to the game untouched.  That matters
@@ -371,16 +336,82 @@ static BOOL TrySkipLine(const char *how)
     if (!tid && !delay)
         return FALSE;               /* nothing is being said right now */
 
-    if (tid) {
-        if (g_haveFadeHook)
-            InterlockedExchange(&g_fadeStart, (LONG)GetTickCount());
-        else
-            StopSpeechCategory();   /* no ramp available; cut it cleanly */
-    }
+    if (tid)
+        StopSpeechCategory();
 
     *(volatile DWORD *)VA_TALK_ID = 0;
     *(volatile WORD *)VA_TALK_DELAY = 0;
     Log("[voice] %s: line skipped (talkid=%u, subtitle=%u)", how, tid, delay);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* patch 1e -- mouse wheel scrolls the classic dialogue list           */
+/* ------------------------------------------------------------------ */
+
+/* Long conversations (the insult swordfights above all) show six lines at a
+ * time with arrows to page through them, and classic mode gives you no way to
+ * work them but the mouse.  The game does handle WM_MOUSEWHEEL, but the handler
+ * bails out immediately in classic mode:
+ *
+ *   0x402AEB  cmp byte ptr [esi+718h], 0    ; classic input active?
+ *   0x402AF2  jne 0x402B5E                  ; -> unhandled
+ *
+ * and what it drives (0x427820) is a Special Edition UI widget, not the classic
+ * list -- bypassing the branch in a running game scrolls nothing.
+ *
+ * The classic arrows, though, are ordinary SCUMM verbs, and verbs carry a
+ * keyboard shortcut.  Reading the verb slots while a swordfight list was up:
+ *
+ *   slot  rect (game coords)        key
+ *   ...   x18..219  y145..153       '1'   dialogue line 1
+ *          ..                       ..    lines 2-6 are '2'..'6'
+ *   +9    x0..16    y145..169       'q'   scroll up
+ *   +10   x0..16    y172..196       'a'   scroll down
+ *
+ * So a wheel notch only has to feed the engine 'q' or 'a'.  That is much better
+ * than synthesising a click on the arrow: no screen-coordinate maths, nothing
+ * resolution dependent, and -- most importantly -- the engine matches a key
+ * against *visible* verbs only, so when the arrows are not on screen the
+ * keystroke does nothing.  The gate we would otherwise have to build ourselves
+ * comes for free, and a stray notch can never pick a dialogue line.
+ *
+ * The character is written straight to the engine's "last key" global rather
+ * than posted as a keystroke.  The game's own key path derives the character
+ * with MapVirtualKey, which is keyboard-layout dependent -- VK_Q yields 'a' on
+ * AZERTY -- and that would scroll the wrong way.  0x48C010 reads this global
+ * and clears it, once per frame.
+ */
+#define VA_GAMEOBJ_PTR   0x004F1070u   /* -> main game object            */
+#define GAMEOBJ_CLASSIC  0x718u        /* byte: classic input active     */
+#define VA_SCUMM_KEY     0x005B98C0u   /* dword: pending key character   */
+
+#define SCUMM_KEY_SCROLL_UP   'q'
+#define SCUMM_KEY_SCROLL_DOWN 'a'
+
+static BOOL ClassicInputActive(void)
+{
+    BYTE *go;
+    if (!Readable(VA_GAMEOBJ_PTR, 4))
+        return FALSE;
+    go = *(BYTE **)VA_GAMEOBJ_PTR;
+    if (!go || !Readable((DWORD)(go + GAMEOBJ_CLASSIC), 1))
+        return FALSE;
+    return *(volatile BYTE *)(go + GAMEOBJ_CLASSIC) != 0;
+}
+
+/* One notch = one line.  The global holds a single character and the engine
+ * consumes it once a frame, so there is nothing to gain by writing it twice. */
+static BOOL WheelScroll(WPARAM wp)
+{
+    short delta;
+    if (!ClassicInputActive() || !Readable(VA_SCUMM_KEY, 4))
+        return FALSE;                  /* SE mode keeps its own wheel use */
+    delta = (short)HIWORD(wp);
+    if (!delta)
+        return FALSE;
+    *(volatile DWORD *)VA_SCUMM_KEY =
+        (delta > 0) ? SCUMM_KEY_SCROLL_UP : SCUMM_KEY_SCROLL_DOWN;
     return TRUE;
 }
 
@@ -440,13 +471,53 @@ typedef struct {
     WORD        hdrOrig;    /* header word as shipped             */
     WORD        hdrPatched; /* header word once RPC22 is removed  */
     int         cues;       /* expected number of edits           */
+    BOOL        listed;     /* edit only the offsets in SFXNEW_FIX */
 } BankFix;
 
-static const BankFix BANKS[] = {
-    { "SpeechCues",   289474u, 0x85BEu, 0xB1CCu, 4547 },
-    { "AmbienceCues",   3899u, 0xF52Eu, 0xECDCu,   30 }
+/* SFXCuesNew is the one bank that cannot be treated wholesale.  It holds 146
+ * cues, but 62 of them are re-recordings of cues that also exist in
+ * SFXCuesOriginal -- which classic mode already plays -- so unmuting the bank
+ * would play both copies of those.  The other 84 are content the original game
+ * never had: the chef crying, ghost laughs, menu clicks, and the AdLib-era
+ * effects the SoundBlaster set never carried.  Only those are touched.
+ *
+ * The cue -> sound mapping was resolved offline (simple cues are 5-byte entries
+ * holding a file offset, complex cues 15 bytes pointing either at a sound or at
+ * a variation table).  Exactly one sound is reachable from both groups -- 0x2C4,
+ * shared by 92_LeChuckPunch and 22_sound_SBL_whack -- so it is deliberately left
+ * muted; the cost is one punch in the LeChuck fight, against reintroducing a
+ * doubled effect.  Format notes are in HANDOFF.md.
+ *
+ * The bank ships with the game and never changes, so the resulting offsets are
+ * baked in rather than recomputed at runtime, which would mean parsing four
+ * tables in the DLL.  Every one is checked to actually hold RPC22 before it is
+ * written, so a bank these were not derived from is left alone. */
+#define SFXNEW_FIX_COUNT 114
+static const WORD SFXNEW_FIX[SFXNEW_FIX_COUNT] = {
+    0x04FB, 0x0585, 0x05F8, 0x0768, 0x07DB, 0x084E, 0x09ED, 0x0A04, 0x0A1B, 0x0A32, 0x0A60, 0x0A77,
+    0x0A8E, 0x0AA5, 0x0BFE, 0x0C88, 0x0C9F, 0x0CB6, 0x0CCD, 0x0D57, 0x0D6E, 0x0D85, 0x0F96, 0x0FC4,
+    0x0FDB, 0x0FF2, 0x1009, 0x1020, 0x1037, 0x104E, 0x1065, 0x107C, 0x1093, 0x10AA, 0x10C1, 0x10D8,
+    0x10EF, 0x1106, 0x111D, 0x1134, 0x114B, 0x1162, 0x1179, 0x1190, 0x11A7, 0x11BE, 0x11D5, 0x11EC,
+    0x1203, 0x121A, 0x1231, 0x1248, 0x125F, 0x1276, 0x128D, 0x12A4, 0x12BB, 0x12D2, 0x12E9, 0x1300,
+    0x1317, 0x132E, 0x1345, 0x135C, 0x13A1, 0x13D6, 0x13ED, 0x1404, 0x141B, 0x1432, 0x1449, 0x1460,
+    0x1477, 0x148E, 0x14A5, 0x14BC, 0x14D3, 0x14EA, 0x1501, 0x1518, 0x152F, 0x1546, 0x155D, 0x1574,
+    0x158B, 0x15A2, 0x15B9, 0x15D0, 0x15E7, 0x15FE, 0x1615, 0x162C, 0x1643, 0x165A, 0x1671, 0x1688,
+    0x169F, 0x16B6, 0x16CD, 0x16E4, 0x16FB, 0x1712, 0x1729, 0x1740, 0x1757, 0x176E, 0x1785, 0x179C,
+    0x17B3, 0x17CA, 0x1826, 0x183D, 0x1854, 0x188F
 };
-#define BANK_COUNT 2
+
+/* The live SFXCuesNew buffer, kept so F9 can flip those offsets back and forth.
+ * XACT reads sound data out of it when a cue starts rather than copying it up
+ * front, which is what makes a runtime flip work at all -- and also why the
+ * buffer is never freed. */
+static BYTE * volatile g_sfxBank = NULL;
+
+static const BankFix BANKS[] = {
+    { "SpeechCues",   289474u, 0x85BEu, 0xB1CCu, 4547, FALSE },
+    { "AmbienceCues",   3899u, 0xF52Eu, 0xECDCu,   30, FALSE },
+    { "SFXCuesNew",    13935u, 0x219Eu, 0xA5E6u,  114, TRUE  }
+};
+#define BANK_COUNT (sizeof(BANKS) / sizeof(BANKS[0]))
 
 #define MAX_BANK_SIZE (16u * 1024u * 1024u)   /* bound before allocating */
 
@@ -458,6 +529,38 @@ typedef HRESULT (WINAPI *PFN_CreateSoundBank)(void *pEngine, const void *pv,
  * orderings occur, and both banks use it, so this is written generically.
  * Requiring the other preset to be a valid offset too keeps it from matching
  * unrelated data that happens to start with 0B 00 02. */
+/* Selective form, for SFXCuesNew: only the listed offsets, each verified first
+ * so a bank these were not derived from is left completely alone. */
+static int RepointListed(BYTE *buf, unsigned int size)
+{
+    int i, n = 0;
+
+    for (i = 0; i < SFXNEW_FIX_COUNT; i++) {
+        WORD o = SFXNEW_FIX[i];
+        if ((unsigned int)o + 4 > size || *(DWORD *)(buf + o) != RPC22)
+            return 0;
+    }
+    for (i = 0; i < SFXNEW_FIX_COUNT; i++, n++)
+        *(DWORD *)(buf + SFXNEW_FIX[i]) = RPC26;
+    return n;
+}
+
+/* F9 flips the new effects between audible and muted in the live bank.  Only
+ * the low word differs between the two preset offsets, so a single 16-bit store
+ * does it -- a dword store would be unaligned at most of these offsets and could
+ * be torn by a concurrent read from the mixer. */
+static void ApplySfxState(BOOL on)
+{
+    WORD want = (WORD)(on ? (RPC26 & 0xFFFF) : (RPC22 & 0xFFFF));
+    BYTE *b = g_sfxBank;
+    int i;
+
+    if (!b)
+        return;
+    for (i = 0; i < SFXNEW_FIX_COUNT; i++)
+        *(volatile WORD *)(b + SFXNEW_FIX[i]) = want;
+}
+
 static int RepointRpc22(BYTE *buf, unsigned int size)
 {
     SIZE_T i;
@@ -598,7 +701,7 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
         return real(pEngine, pv, size, f1, f2, ppSB);
     MemCpy(work, src, size);
 
-    n = RepointRpc22(work, size);
+    n = fix->listed ? RepointListed(work, size) : RepointRpc22(work, size);
     if (n == 0) {
         VirtualFree(work, 0, MEM_RELEASE);
         return real(pEngine, pv, size, f1, f2, ppSB);
@@ -620,6 +723,10 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
         *ppSB = NULL;
         hr = real(pEngine, work, size, f1, f2, ppSB);
         if (hr >= 0 && *ppSB) {
+            if (fix->listed) {
+                g_sfxBank = work;
+                ApplySfxState(g_ambienceOn != 0);
+            }
             Log("[voice] %s OK: RPC22 detached from %d/%d cues",
                 fix->tag, n, fix->cues);
             return hr;                  /* work intentionally not freed */
@@ -638,6 +745,10 @@ HRESULT __stdcall HookedCreateSoundBank(PFN_CreateSoundBank real, void *pEngine,
             hr = real(pEngine, work, size, f1, f2, ppSB);
             if (hr >= 0 && *ppSB) {
                 CacheStore(size, orig, (WORD)c);
+                if (fix->listed) {
+                    g_sfxBank = work;
+                    ApplySfxState(g_ambienceOn != 0);
+                }
                 Log("[voice] header word = 0x%04X after %u ms; cached. "
                     "RPC22 detached from %d cues", c, GetTickCount() - t0, n);
                 return hr;              /* work intentionally not freed */
@@ -733,7 +844,9 @@ static LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         if (wp == VK_TOGGLE_AMBIENCE) {
             LONG was = InterlockedExchange(&g_ambienceOn, g_ambienceOn ? 0 : 1);
-            Log("[voice] F9: room ambience %s", was ? "OFF" : "ON");
+            ApplySfxState(!was);
+            Log("[voice] F9: Special Edition sounds %s (ambience + %d new "
+                "effects)", was ? "OFF" : "ON", SFXNEW_FIX_COUNT);
             return 0;                   /* swallow it */
         }
         /* The game maps unhandled keys through MapVirtualKey into its SCUMM
@@ -748,6 +861,9 @@ static LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     /* Only swallowed when it actually skipped, so the button keeps its normal
      * meaning everywhere else. */
     if (msg == WM_RBUTTONDOWN && TrySkipLine("right click"))
+        return 0;
+
+    if (msg == WM_MOUSEWHEEL && WheelScroll(wp))
         return 0;
 
     return CallWindowProcA(g_origWndProc, hwnd, msg, wp, lp);
@@ -765,7 +881,9 @@ static BOOL InstallSubclass(void)
         SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)OurWndProc);
     if (!g_origWndProc)
         return FALSE;
-    Log("[voice] F9 ambience toggle armed (hwnd 0x%08X)", (DWORD)(UINT_PTR)hwnd);
+    Log("[voice] input hooks armed: F9 = Special Edition sounds, "
+        ", / . / right click = skip line, wheel = scroll dialogue "
+        "(hwnd 0x%08X)", (DWORD)(UINT_PTR)hwnd);
     return TRUE;
 }
 
@@ -784,7 +902,7 @@ static DWORD WINAPI PatchThread(LPVOID unused)
 {
     int i;
     BOOL didVol = FALSE, didBank = FALSE, didHold = FALSE;
-    BOOL didAmb = FALSE, didHook = FALSE, didFade = FALSE;
+    BOOL didAmb = FALSE, didHook = FALSE;
 
     (void)unused;
 
@@ -822,44 +940,32 @@ static DWORD WINAPI PatchThread(LPVOID unused)
                     VA_CSB_CALL, i);
             }
         }
-        if (!didAmb && Readable(VA_AMBVOL, sizeof(SIG_AMBVOL)) &&
-            MemCmp((const void *)VA_AMBVOL, SIG_AMBVOL, sizeof(SIG_AMBVOL)) == 0) {
-            BYTE det[6];
+        if (!didAmb && Readable(VA_AMBARG, sizeof(SIG_AMBARG)) &&
+            MemCmp((const void *)VA_AMBARG, SIG_AMBARG, sizeof(SIG_AMBARG)) == 0) {
+            BYTE det[7];
             det[0] = 0xE8;                          /* call rel32 */
-            *(DWORD *)(det + 1) =
-                (DWORD)((BYTE *)AmbienceVolStub - (BYTE *)(VA_AMBVOL + 5));
-            det[5] = 0x90;                          /* nop, to fill 6 bytes */
-            if (WriteCode(VA_AMBVOL, det, 6)) {
+            *(DWORD *)(det + 1) = (DWORD)((BYTE *)AmbienceArgStub -
+                (BYTE *)(VA_AMBARG + AMBARG_PATCH_OFS + 5));
+            det[5] = 0x90;                          /* nop, to fill 7 bytes */
+            det[6] = 0x90;
+            if (WriteCode(VA_AMBARG + AMBARG_PATCH_OFS, det, 7)) {
                 didAmb = TRUE;
-                Log("[voice] ambience volume hooked @0x%08X (t=%d ms)", VA_AMBVOL, i);
-            }
-        }
-        if (!didFade && Readable(VA_SPEECHVOL_STORE, sizeof(SIG_SPEECHVOL_STORE)) &&
-            MemCmp((const void *)VA_SPEECHVOL_STORE, SIG_SPEECHVOL_STORE,
-                   sizeof(SIG_SPEECHVOL_STORE)) == 0) {
-            BYTE call5[5];
-            call5[0] = 0xE8;                    /* call rel32 */
-            *(DWORD *)(call5 + 1) = (DWORD)((BYTE *)SpeechVolStub -
-                (BYTE *)(VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS + 5));
-            if (WriteCode(VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS, call5, 5)) {
-                didFade = TRUE;
-                g_haveFadeHook = TRUE;
-                Log("[voice] speech fade hooked @0x%08X (t=%d ms)",
-                    VA_SPEECHVOL_STORE + SPEECHVOL_STORE_OFS, i);
+                Log("[voice] ambience argument hooked @0x%08X (t=%d ms)",
+                    VA_AMBARG + AMBARG_PATCH_OFS, i);
             }
         }
         /* the game window does not exist as early as the code patches */
         if (!didHook)
             didHook = InstallSubclass();
 
-        if (didVol && didBank && didHold && didAmb && didHook && didFade)
+        if (didVol && didBank && didHold && didAmb && didHook)
             return 0;
         Sleep(1);
     }
 
-    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d amb=%d hook=%d"
-        " fade=%d) - unexpected build?",
-        didVol, didBank, didHold, didAmb, didHook, didFade);
+    Log("[voice] FAILED to apply patches (vol=%d bank=%d hold=%d amb=%d"
+        " hook=%d) - unexpected build?",
+        didVol, didBank, didHold, didAmb, didHook);
     return 0;
 }
 
